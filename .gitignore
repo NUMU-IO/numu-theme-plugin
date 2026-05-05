@@ -1,0 +1,7 @@
+node_modules
+dist
+*.log
+
+# Avoid committing npm lockfile — repo will use pnpm to match the rest
+# of the @numu org once a developer installs.
+package-lock.json
