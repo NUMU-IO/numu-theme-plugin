@@ -45,12 +45,26 @@ import type { Plugin, UserConfig, ResolvedConfig } from "vite";
 
 // ── Federation contract ──────────────────────────────────────────────────────
 //
-// The host storefront supplies these modules via `globalThis` at runtime
-// (see `@numu/theme-sdk/utils/federation`). Themes import from them as
-// usual; rollup leaves the imports as bare specifiers and the host's
-// import-map / module shim resolves them.
+// Themes can be built in two modes:
+//
+//  - federated (default): bare-specifier imports of react/jsx-runtime,
+//    react-dom, @numu/theme-sdk are externalized, resolved at runtime
+//    via the import map the storefront ships at /__numu-runtime/. Bundle
+//    drops from ~350 KB → ~30 KB and shares one React instance with the
+//    host (so context plumbing across the seam works without any
+//    singleton-shim gymnastics).
+//
+//  - self-contained: pass `numuTheme({ federate: false })` to bundle
+//    react + sdk inline. Useful when running against a host that
+//    doesn't (yet) ship a runtime import map. Two-React risks are
+//    acceptable because the bundle mounts inside `ByotThemeBoundary`,
+//    which renders the theme as a leaf — no JSX crosses the boundary,
+//    so the host React never reconciles bundle elements.
+//
+// As of plugin 0.2.0 (numu-storefront federation runtime shipped) we
+// default to federated. Existing self-contained builds keep working.
 
-const HOST_PROVIDED_MODULES = [
+const FEDERATABLE_MODULES = [
   "react",
   "react/jsx-runtime",
   "react/jsx-dev-runtime",
@@ -74,7 +88,15 @@ export interface NumuThemePluginOptions {
   themeDir?: string;
   /** Skip the contract check (escape hatch for tests). */
   skipValidation?: boolean;
-  /** Additional modules to externalize beyond the host-provided defaults. */
+  /**
+   * Externalize React + react-dom + jsx-runtime + @numu/theme-sdk so the
+   * bundle imports them as bare specifiers. Requires the host to provide
+   * an import map. Default: true — host storefronts ≥ 0.2.0 ship the
+   * runtime import map at /__numu-runtime/. Pass `federate: false` for a
+   * self-contained bundle when targeting older hosts.
+   */
+  federate?: boolean;
+  /** Additional modules to externalize beyond the federation defaults. */
   extraExternal?: readonly string[];
 }
 
@@ -95,7 +117,16 @@ interface BuiltManifest extends ThemeManifest {
   plugin_version: string;
 }
 
-const PLUGIN_VERSION = "0.1.0";
+const PLUGIN_VERSION = "0.2.0";
+
+/**
+ * The minimum @numu/theme-sdk major a federated bundle is compatible
+ * with. The host advertises its sdk_version in
+ * /__numu-runtime/manifest.json; install validation refuses bundles
+ * whose `sdk_compat` major doesn't match the host's. Bumped on every
+ * SDK breaking change.
+ */
+const SDK_COMPAT_MAJOR = 0;
 
 // ── Contract validation ─────────────────────────────────────────────────────
 
@@ -120,13 +151,45 @@ function validateContract(themeDir: string): ThemeManifest {
     }
   }
 
-  const hasEntry = ENTRY_CANDIDATES.some((p) =>
+  const entry = ENTRY_CANDIDATES.find((p) =>
     fs.existsSync(path.join(themeDir, p)),
   );
-  if (!hasEntry) {
+  if (!entry) {
     throw new Error(
       `[@numu/theme-plugin] Missing entry point. Expected one of: ${ENTRY_CANDIDATES.join(", ")}`,
     );
+  }
+
+  // BYOT mount contract — the host's <ByotThemeBoundary> calls
+  // `mod.mount(el, props)` with its own React copy. If the entry doesn't
+  // export `mount`, the bundle still loads but the host can't render it
+  // (we throw a runtime error there). Catch it at build time instead so
+  // theme devs see a clear message immediately.
+  //
+  // We do a lightweight text-level check rather than parsing the full
+  // module — any of `export function mount`, `export const mount`,
+  // `export { mount }`, `export { … as mount }` count.
+  try {
+    const entrySource = fs.readFileSync(
+      path.join(themeDir, entry),
+      "utf-8",
+    );
+    const exportsMount =
+      /\bexport\s+(?:async\s+)?function\s+mount\b/.test(entrySource) ||
+      /\bexport\s+(?:const|let|var)\s+mount\b/.test(entrySource) ||
+      /\bexport\s*\{[^}]*\bmount\b[^}]*\}/.test(entrySource);
+    if (!exportsMount) {
+      throw new Error(
+        `[@numu/theme-plugin] Theme entry ${entry} must export a \`mount(el, props)\` function. ` +
+          `BYOT bundles need to own their React render cycle — without mount, ` +
+          `the storefront throws "Cannot read properties of null (reading 'useContext')" ` +
+          `the moment any SDK hook runs. \`numu-theme init\` scaffolds this for new themes.`,
+      );
+    }
+  } catch (err) {
+    // Re-throw our own clear error; suppress fs read errors (build will
+    // surface those in its normal flow).
+    if ((err as Error).message?.startsWith("[@numu/theme-plugin]")) throw err;
   }
 
   let manifest: ThemeManifest;
@@ -199,12 +262,86 @@ function collectSchemas(themeDir: string): SchemaBundle {
   return { settings, sections, blocks };
 }
 
+/**
+ * Phase 2.6 — registry/schema sync check.
+ *
+ * Verify that every section schema (`schemas/sections/<type>.json`) has
+ * a matching component (`src/sections/<Type>.{tsx,ts,jsx,js}`) AND vice
+ * versa. The two sides are read at different times (customizer reads
+ * the schema; storefront mounts the component), so drift is invisible
+ * in dev until a merchant adds the section in the customizer and the
+ * storefront crashes with "unknown section type".
+ *
+ * Hard fails on schema-without-component (the storefront WILL crash).
+ * Soft warns on component-without-schema (the section is just unreachable).
+ *
+ * Looks for components by basename match (case-insensitive). If a theme
+ * uses defineSection({ schema: { type: "<id>" } }) with a non-matching
+ * filename, the basename check is wrong — but our recommendation is
+ * one section per file with `<Type>.tsx` named after `schema.type`,
+ * which the codegen step also assumes for sections.d.ts.
+ */
+function validateSectionRegistry(themeDir: string): void {
+  const sectionsDir = path.join(themeDir, "src", "sections");
+  const schemaDir = path.join(themeDir, "schemas", "sections");
+
+  const componentNames = new Set<string>();
+  if (fs.existsSync(sectionsDir)) {
+    for (const entry of fs.readdirSync(sectionsDir)) {
+      if (!/\.(tsx|ts|jsx|js)$/.test(entry)) continue;
+      componentNames.add(
+        path.basename(entry, path.extname(entry)).toLowerCase(),
+      );
+    }
+  }
+  const schemaNames = new Set<string>();
+  if (fs.existsSync(schemaDir)) {
+    for (const entry of fs.readdirSync(schemaDir)) {
+      if (!entry.endsWith(".json")) continue;
+      schemaNames.add(path.basename(entry, ".json").toLowerCase());
+    }
+  }
+
+  // Schema without component → hard fail. The storefront CAN'T render
+  // this when a merchant adds it.
+  const orphanSchemas: string[] = [];
+  for (const name of schemaNames) {
+    if (!componentNames.has(name)) orphanSchemas.push(name);
+  }
+  if (orphanSchemas.length > 0) {
+    throw new Error(
+      `[@numu/theme-plugin] schemas/sections/ has ${orphanSchemas.length} ` +
+        `entr${orphanSchemas.length === 1 ? "y" : "ies"} without a matching component:\n` +
+        orphanSchemas.map((n) => `  - schemas/sections/${n}.json (no src/sections/${n}.tsx)`).join("\n") +
+        `\n\nThe storefront throws "unknown section type" the moment a ` +
+        `merchant adds one of these via the customizer. Either add the ` +
+        `component file or remove the schema.`,
+    );
+  }
+
+  // Component without schema → soft warn (won't crash, just unreachable).
+  const orphanComponents: string[] = [];
+  for (const name of componentNames) {
+    if (!schemaNames.has(name)) orphanComponents.push(name);
+  }
+  if (orphanComponents.length > 0 && process.env.NUMU_THEME_VERBOSE) {
+    console.warn(
+      `[@numu/theme-plugin] ${orphanComponents.length} section(s) have no ` +
+        `schema and won't be addable from the customizer:`,
+    );
+    for (const n of orphanComponents) {
+      console.warn(`  - src/sections/${n}.tsx (no schemas/sections/${n}.json)`);
+    }
+  }
+}
+
 // ── The plugin ──────────────────────────────────────────────────────────────
 
 export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
   const themeDir = options.themeDir ?? process.cwd();
+  const federate = options.federate ?? true;
   const externalList = [
-    ...HOST_PROVIDED_MODULES,
+    ...(federate ? FEDERATABLE_MODULES : []),
     ...(options.extraExternal ?? []),
   ];
 
@@ -220,12 +357,26 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
       //    time configuring the bundler.
       if (!options.skipValidation) {
         manifest = validateContract(themeDir);
+        // Registry/schema sync (Phase 2.6). Catches the
+        // schemas-without-components drift before customizer runtime.
+        validateSectionRegistry(themeDir);
       }
 
       // 2. Externalize host-provided modules. We MERGE rather than replace
       //    so a theme can add its own externals (like a heavyweight CMS
       //    SDK shared with the host) via build.rollupOptions.external.
+      //
+      //    Also inline `process.env.NODE_ENV` — when React + react-dom are
+      //    bundled in (federate=false), they reference `process.env.NODE_ENV`
+      //    at runtime. Browsers have no `process`, so without a build-time
+      //    replacement the bundle throws "process is not defined" the
+      //    moment the host imports it. Themes are produced and consumed
+      //    in production mode regardless of how the host runs.
       const merged: UserConfig = {
+        define: {
+          ...userConfig.define,
+          "process.env.NODE_ENV": JSON.stringify("production"),
+        },
         build: {
           ...userConfig.build,
           rollupOptions: {
@@ -253,6 +404,96 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
       resolvedConfig = config;
     },
 
+    // Mount middleware so the dev server satisfies the backend dev-mode
+    // contract (`POST /stores/{id}/themes/external/dev-mode`). The probe
+    // expects:
+    //   GET  /theme.json            (Vite already serves from project root)
+    //   GET  /settings_schema.json  (Vite already serves from project root)
+    //   GET  /sections.json         (optional — synthesized from schemas/)
+    //   HEAD /theme.js              (this middleware — from dist/)
+    //   GET  /theme.css             (this middleware — from dist/)
+    //
+    // The dev-mode connector also stores those URLs in
+    // store_themes.external_theme so the storefront loads `theme.js` from
+    // the dev server. After running `numu-theme build` once you can paste
+    // `http://localhost:5173` into the hub's "Connect dev server" dialog.
+    configureServer(server) {
+      const distDir = path.join(themeDir, "dist");
+
+      function sendFile(
+        res: import("http").ServerResponse,
+        filePath: string,
+        contentType: string,
+        method: string,
+      ) {
+        if (!fs.existsSync(filePath)) {
+          res.statusCode = 404;
+          res.setHeader("Content-Type", "text/plain; charset=utf-8");
+          res.end(
+            `[@numu/theme-plugin] ${path.basename(filePath)} not found. ` +
+              `Run \`numu-theme build\` first so the dev-mode connector can ` +
+              `find theme.js and theme.css.`,
+          );
+          return;
+        }
+        const stat = fs.statSync(filePath);
+        res.setHeader("Content-Type", contentType);
+        res.setHeader("Content-Length", String(stat.size));
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Cache-Control", "no-store");
+        if (method === "HEAD") {
+          res.end();
+          return;
+        }
+        fs.createReadStream(filePath).pipe(res);
+      }
+
+      server.middlewares.use("/theme.js", (req, res, next) => {
+        if (req.method !== "GET" && req.method !== "HEAD") return next();
+        sendFile(
+          res,
+          path.join(distDir, "theme.js"),
+          "application/javascript; charset=utf-8",
+          req.method,
+        );
+      });
+
+      server.middlewares.use("/theme.css", (req, res, next) => {
+        if (req.method !== "GET" && req.method !== "HEAD") return next();
+        sendFile(
+          res,
+          path.join(distDir, "theme.css"),
+          "text/css; charset=utf-8",
+          req.method,
+        );
+      });
+
+      // sections.json: synthesize from schemas/sections + schemas/blocks
+      // on the fly so themes don't have to maintain a redundant file.
+      server.middlewares.use("/sections.json", (req, res, next) => {
+        if (req.method !== "GET" && req.method !== "HEAD") return next();
+        try {
+          const schemas = collectSchemas(themeDir);
+          const body = JSON.stringify({
+            sections: schemas.sections,
+            blocks: schemas.blocks,
+          });
+          res.setHeader("Content-Type", "application/json; charset=utf-8");
+          res.setHeader("Access-Control-Allow-Origin", "*");
+          res.setHeader("Cache-Control", "no-store");
+          if (req.method === "HEAD") {
+            res.setHeader("Content-Length", String(Buffer.byteLength(body)));
+            res.end();
+            return;
+          }
+          res.end(body);
+        } catch (err) {
+          res.statusCode = 500;
+          res.end(String((err as Error).message));
+        }
+      });
+    },
+
     closeBundle() {
       if (!manifest && !options.skipValidation) {
         // Either validation is off or we somehow lost it; reload.
@@ -267,6 +508,40 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
         // be defensive.
         return;
       }
+
+      // 3a. Copy styles.css → dist/theme.css.
+      //
+      // The contract requires every theme to ship a styles.css. We
+      // can't rely on Vite to emit one — Vite only emits CSS that's
+      // *imported* by the entry, and our themes import styles.css
+      // from index.html (dev-only) rather than from src/main.tsx.
+      // The host expects `theme.css` next to `theme.js` and loads it
+      // via `loadExternalCSS(external_theme.css_url)`, so we copy
+      // verbatim. Existing dist/theme.css from a real Vite emit (if
+      // a theme later starts importing styles from main.tsx) takes
+      // precedence — we only write the fallback when there isn't
+      // already a CSS output.
+      const stylesPath = path.join(themeDir, "styles.css");
+      const distCssPath = path.join(outDir, "theme.css");
+      if (fs.existsSync(stylesPath) && !fs.existsSync(distCssPath)) {
+        fs.copyFileSync(stylesPath, distCssPath);
+      }
+
+      // 3b. Emit src/__generated__/sections.d.ts
+      //
+      // Theme devs would otherwise type section settings as
+      // Record<string, any> and lose autocomplete + lose the safety
+      // net when they rename/remove a setting in the schema. We map
+      // each schema's settings array to a TypeScript interface and
+      // produce a `SectionSettings` map keyed by section type. Themes
+      // import like:
+      //
+      //   import type { SectionSettings } from "../__generated__/sections";
+      //   const s = settings as SectionSettings["hero"];
+      //
+      // Regenerated on every build; the developer should `.gitignore`
+      // the file (or commit if they prefer — it's deterministic).
+      writeSectionTypes(themeDir, collectSchemas(themeDir).sections);
 
       // 3. Emit dist/manifest.json
       const schemas = collectSchemas(themeDir);
@@ -284,8 +559,22 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
       );
 
       // 4. Emit dist/import-map.json so the host can verify SDK compatibility.
+      //
+      // The marketplace install endpoint reads this file (extracted from
+      // the uploaded ZIP) and refuses bundles whose `sdk_compat_major`
+      // doesn't match the host's currently-served SDK major. Without it
+      // a theme built against an older SDK could silently 404 on hooks
+      // that no longer exist or — worse — call API shapes the host has
+      // since changed.
+      //
+      // `host_provided` is the list of bare specifiers the bundle
+      // expects the import map to resolve. The host's runtime manifest
+      // must satisfy all of them (today: react, react/jsx-runtime,
+      // react-dom, react-dom/client, @numu/theme-sdk).
       const importMap = {
         plugin: PLUGIN_VERSION,
+        federate,
+        sdk_compat_major: SDK_COMPAT_MAJOR,
         host_provided: externalList,
       };
       fs.writeFileSync(
@@ -297,6 +586,103 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Map a schema setting type to its TypeScript representation.
+ *
+ * We deliberately go narrow on the unions (e.g. select → literal union
+ * of option values) so theme devs catch typos at compile time. When a
+ * setting has no constraint we widen to `string` / `number` / etc.
+ */
+function settingTsType(setting: unknown): string {
+  if (!setting || typeof setting !== "object") return "unknown";
+  const s = setting as { type?: string; options?: { value?: unknown }[] };
+  switch (s.type) {
+    case "text":
+    case "textarea":
+    case "richtext":
+    case "url":
+    case "image_picker":
+    case "video_picker":
+    case "html":
+    case "color":
+    case "color_scheme":
+    case "font":
+    case "font_picker":
+    case "product":
+    case "collection":
+    case "blog_picker":
+    case "page_picker":
+    case "link_list_picker":
+    case "date":
+    case "time":
+    case "file_upload":
+      return "string";
+    case "number":
+    case "range":
+      return "number";
+    case "checkbox":
+      return "boolean";
+    case "select":
+    case "radio": {
+      const opts = Array.isArray(s.options) ? s.options : [];
+      const literals = opts
+        .map((o) => (typeof o.value === "string" ? `"${o.value}"` : null))
+        .filter((v): v is string => !!v);
+      return literals.length > 0 ? literals.join(" | ") : "string";
+    }
+    default:
+      return "unknown";
+  }
+}
+
+function writeSectionTypes(
+  themeDir: string,
+  sections: Record<string, unknown>,
+): void {
+  const outDir = path.join(themeDir, "src", "__generated__");
+  fs.mkdirSync(outDir, { recursive: true });
+
+  const lines: string[] = [
+    "// This file is auto-generated by @numu/theme-plugin. Do not edit.",
+    "// Regenerated on every `numu-theme build` from schemas/sections/*.json.",
+    "//",
+    "// Use it to get typed section settings:",
+    "//   import type { SectionSettings } from './__generated__/sections';",
+    "//   const s = settings as SectionSettings['hero'];",
+    "",
+    "export interface SectionSettings {",
+  ];
+
+  for (const [type, raw] of Object.entries(sections)) {
+    if (!raw || typeof raw !== "object") continue;
+    const schema = raw as {
+      settings?: { id?: unknown; type?: unknown; default?: unknown }[];
+    };
+    const fields: string[] = [];
+    for (const s of schema.settings ?? []) {
+      if (!s || typeof s !== "object") continue;
+      const id = (s as { id?: unknown }).id;
+      if (typeof id !== "string") continue;
+      const tsType = settingTsType(s);
+      // All settings are optional — merchants may not have set them yet
+      // and presets only cover the initial state.
+      fields.push(`    ${JSON.stringify(id)}?: ${tsType};`);
+    }
+    if (fields.length === 0) {
+      lines.push(`  ${JSON.stringify(type)}: Record<string, never>;`);
+    } else {
+      lines.push(`  ${JSON.stringify(type)}: {`);
+      lines.push(...fields);
+      lines.push("  };");
+    }
+  }
+
+  lines.push("}");
+  lines.push("");
+
+  fs.writeFileSync(path.join(outDir, "sections.d.ts"), lines.join("\n"));
+}
 
 function detectEntry(themeDir: string): string {
   for (const candidate of ENTRY_CANDIDATES) {

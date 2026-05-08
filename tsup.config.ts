@@ -8,4 +8,9 @@ export default defineConfig({
   sourcemap: true,
   clean: true,
   external: ["vite"],
+  // Emit `.cjs` for CommonJS and `.mjs` for ESM so the dual-package
+  // exports map in package.json maps to real files.
+  outExtension({ format }) {
+    return { js: format === "cjs" ? ".cjs" : ".mjs" };
+  },
 });
