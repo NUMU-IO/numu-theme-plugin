@@ -1,21 +1,58 @@
 {
-  "name": "@numu/theme-plugin",
+  "name": "@numueg/theme-plugin",
   "version": "0.1.0",
-  "description": "Vite plugin for NUMU themes — validates the manifest, externalizes the SDK + React, and emits the federation manifest expected by the host storefront.",
+  "description": "Vite plugin for NUMU themes — validates the manifest, externalizes the SDK + React, emits the federation manifest, and generates section schema types",
+  "keywords": [
+    "numu",
+    "theme",
+    "vite-plugin",
+    "vite",
+    "storefront",
+    "ecommerce",
+    "byot",
+    "federation"
+  ],
+  "license": "MIT",
+  "author": "NUMU <hello@numueg.app>",
+  "homepage": "https://numueg.app/docs/cli-plugin/vite-plugin",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NUMU-IO/numu-theme-plugin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/NUMU-IO/numu-theme-plugin/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "main": "./dist/index.cjs",
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.mjs",
-      "require": "./dist/index.cjs",
-      "types": "./dist/index.d.ts"
-    }
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=18"
   },
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm run build",
+    "pack:dry": "npm pack --dry-run"
   },
   "peerDependencies": {
     "vite": ">=5"
@@ -25,7 +62,5 @@
     "tsup": "^8.4.0",
     "typescript": "^5.8.0",
     "vite": "^6.0.0"
-  },
-  "files": ["dist"],
-  "license": "MIT"
+  }
 }

@@ -1,5 +1,5 @@
 /**
- * @numu/theme-plugin — the Vite plugin every NUMU theme uses to build.
+ * @numueg/theme-plugin — the Vite plugin every NUMU theme uses to build.
  *
  * What it does (in order):
  *   1. validateContract  — at config-resolved time, verifies the project on
@@ -7,8 +7,8 @@
  *      rules the backend `theme_upload_tasks._validate_theme_contract`
  *      enforces — failing here saves a worker round-trip.
  *   2. externalizeRuntimes — adds React, react/jsx-runtime, react-dom and
- *      `@numu/theme-sdk` to `build.rollupOptions.external`. The host
- *      storefront supplies these via `@numu/theme-sdk/utils/federation`
+ *      `@numueg/theme-sdk` to `build.rollupOptions.external`. The host
+ *      storefront supplies these via `@numueg/theme-sdk/utils/federation`
  *      at runtime, so they must NOT be bundled into the theme artifact.
  *   3. emitManifest — at build end, writes `dist/manifest.json` with
  *      a normalized snapshot of theme.json + every section/block schema
@@ -24,7 +24,7 @@
  *
  *     import { defineConfig } from "vite";
  *     import react from "@vitejs/plugin-react";
- *     import { numuTheme } from "@numu/theme-plugin";
+ *     import { numuTheme } from "@numueg/theme-plugin";
  *
  *     export default defineConfig({
  *       plugins: [react(), numuTheme()],
@@ -48,7 +48,7 @@ import type { Plugin, UserConfig, ResolvedConfig } from "vite";
 // Themes can be built in two modes:
 //
 //  - federated (default): bare-specifier imports of react/jsx-runtime,
-//    react-dom, @numu/theme-sdk are externalized, resolved at runtime
+//    react-dom, @numueg/theme-sdk are externalized, resolved at runtime
 //    via the import map the storefront ships at /__numu-runtime/. Bundle
 //    drops from ~350 KB → ~30 KB and shares one React instance with the
 //    host (so context plumbing across the seam works without any
@@ -70,7 +70,7 @@ const FEDERATABLE_MODULES = [
   "react/jsx-dev-runtime",
   "react-dom",
   "react-dom/client",
-  "@numu/theme-sdk",
+  "@numueg/theme-sdk",
 ] as const;
 
 interface ThemeManifest {
@@ -129,7 +129,7 @@ export interface NumuThemePluginOptions {
   /** Skip the contract check (escape hatch for tests). */
   skipValidation?: boolean;
   /**
-   * Externalize React + react-dom + jsx-runtime + @numu/theme-sdk so the
+   * Externalize React + react-dom + jsx-runtime + @numueg/theme-sdk so the
    * bundle imports them as bare specifiers. Requires the host to provide
    * an import map. Default: true — host storefronts ≥ 0.2.0 ship the
    * runtime import map at /__numu-runtime/. Pass `federate: false` for a
@@ -160,7 +160,7 @@ interface BuiltManifest extends ThemeManifest {
 const PLUGIN_VERSION = "0.2.0";
 
 /**
- * The minimum @numu/theme-sdk major a federated bundle is compatible
+ * The minimum @numueg/theme-sdk major a federated bundle is compatible
  * with. The host advertises its sdk_version in
  * /__numu-runtime/manifest.json; install validation refuses bundles
  * whose `sdk_compat` major doesn't match the host's. Bumped on every
@@ -187,7 +187,7 @@ const ENTRY_CANDIDATES = [
 function validateContract(themeDir: string): ThemeManifest {
   for (const f of REQUIRED_FILES) {
     if (!fs.existsSync(path.join(themeDir, f))) {
-      throw new Error(`[@numu/theme-plugin] Missing required file: ${f}`);
+      throw new Error(`[@numueg/theme-plugin] Missing required file: ${f}`);
     }
   }
 
@@ -196,7 +196,7 @@ function validateContract(themeDir: string): ThemeManifest {
   );
   if (!entry) {
     throw new Error(
-      `[@numu/theme-plugin] Missing entry point. Expected one of: ${ENTRY_CANDIDATES.join(", ")}`,
+      `[@numueg/theme-plugin] Missing entry point. Expected one of: ${ENTRY_CANDIDATES.join(", ")}`,
     );
   }
 
@@ -220,7 +220,7 @@ function validateContract(themeDir: string): ThemeManifest {
       /\bexport\s*\{[^}]*\bmount\b[^}]*\}/.test(entrySource);
     if (!exportsMount) {
       throw new Error(
-        `[@numu/theme-plugin] Theme entry ${entry} must export a \`mount(el, props)\` function. ` +
+        `[@numueg/theme-plugin] Theme entry ${entry} must export a \`mount(el, props)\` function. ` +
           `BYOT bundles need to own their React render cycle — without mount, ` +
           `the storefront throws "Cannot read properties of null (reading 'useContext')" ` +
           `the moment any SDK hook runs. \`numu-theme init\` scaffolds this for new themes.`,
@@ -229,7 +229,7 @@ function validateContract(themeDir: string): ThemeManifest {
   } catch (err) {
     // Re-throw our own clear error; suppress fs read errors (build will
     // surface those in its normal flow).
-    if ((err as Error).message?.startsWith("[@numu/theme-plugin]")) throw err;
+    if ((err as Error).message?.startsWith("[@numueg/theme-plugin]")) throw err;
   }
 
   let manifest: ThemeManifest;
@@ -239,14 +239,14 @@ function validateContract(themeDir: string): ThemeManifest {
     );
   } catch (err) {
     throw new Error(
-      `[@numu/theme-plugin] theme.json is not valid JSON: ${(err as Error).message}`,
+      `[@numueg/theme-plugin] theme.json is not valid JSON: ${(err as Error).message}`,
     );
   }
 
   for (const field of ["id", "name", "version"] as const) {
     if (!manifest[field] || typeof manifest[field] !== "string") {
       throw new Error(
-        `[@numu/theme-plugin] theme.json missing required string field: ${field}`,
+        `[@numueg/theme-plugin] theme.json missing required string field: ${field}`,
       );
     }
   }
@@ -255,14 +255,14 @@ function validateContract(themeDir: string): ThemeManifest {
   const semver = /^\d+\.\d+\.\d+(?:[-+][\w.\-]+)?$/;
   if (!semver.test(manifest.version)) {
     throw new Error(
-      `[@numu/theme-plugin] theme.json version "${manifest.version}" is not semver (x.y.z)`,
+      `[@numueg/theme-plugin] theme.json version "${manifest.version}" is not semver (x.y.z)`,
     );
   }
 
   // Validate id format (alphanumeric, dashes, underscores).
   if (!/^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$/i.test(manifest.id)) {
     throw new Error(
-      `[@numu/theme-plugin] theme.json id "${manifest.id}" must be alphanumerics, dashes or underscores`,
+      `[@numueg/theme-plugin] theme.json id "${manifest.id}" must be alphanumerics, dashes or underscores`,
     );
   }
 
@@ -277,7 +277,7 @@ function readJsonOrEmpty(p: string): unknown {
     return JSON.parse(fs.readFileSync(p, "utf-8"));
   } catch (err) {
     throw new Error(
-      `[@numu/theme-plugin] Bad JSON in ${path.basename(p)}: ${(err as Error).message}`,
+      `[@numueg/theme-plugin] Bad JSON in ${path.basename(p)}: ${(err as Error).message}`,
     );
   }
 }
@@ -350,7 +350,7 @@ function validateSectionRegistry(themeDir: string): void {
   }
   if (orphanSchemas.length > 0) {
     throw new Error(
-      `[@numu/theme-plugin] schemas/sections/ has ${orphanSchemas.length} ` +
+      `[@numueg/theme-plugin] schemas/sections/ has ${orphanSchemas.length} ` +
         `entr${orphanSchemas.length === 1 ? "y" : "ies"} without a matching component:\n` +
         orphanSchemas.map((n) => `  - schemas/sections/${n}.json (no src/sections/${n}.tsx)`).join("\n") +
         `\n\nThe storefront throws "unknown section type" the moment a ` +
@@ -366,7 +366,7 @@ function validateSectionRegistry(themeDir: string): void {
   }
   if (orphanComponents.length > 0 && process.env.NUMU_THEME_VERBOSE) {
     console.warn(
-      `[@numu/theme-plugin] ${orphanComponents.length} section(s) have no ` +
+      `[@numueg/theme-plugin] ${orphanComponents.length} section(s) have no ` +
         `schema and won't be addable from the customizer:`,
     );
     for (const n of orphanComponents) {
@@ -389,7 +389,7 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
   let resolvedConfig: ResolvedConfig | null = null;
 
   return {
-    name: "@numu/theme-plugin",
+    name: "@numueg/theme-plugin",
     enforce: "pre",
 
     config(userConfig: UserConfig) {
@@ -470,7 +470,7 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
           res.statusCode = 404;
           res.setHeader("Content-Type", "text/plain; charset=utf-8");
           res.end(
-            `[@numu/theme-plugin] ${path.basename(filePath)} not found. ` +
+            `[@numueg/theme-plugin] ${path.basename(filePath)} not found. ` +
               `Run \`numu-theme build\` first so the dev-mode connector can ` +
               `find theme.js and theme.css.`,
           );
@@ -670,7 +670,7 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
       // `host_provided` is the list of bare specifiers the bundle
       // expects the import map to resolve. The host's runtime manifest
       // must satisfy all of them (today: react, react/jsx-runtime,
-      // react-dom, react-dom/client, @numu/theme-sdk).
+      // react-dom, react-dom/client, @numueg/theme-sdk).
       const importMap = {
         plugin: PLUGIN_VERSION,
         federate,
@@ -744,7 +744,7 @@ function writeSectionTypes(
   fs.mkdirSync(outDir, { recursive: true });
 
   const lines: string[] = [
-    "// This file is auto-generated by @numu/theme-plugin. Do not edit.",
+    "// This file is auto-generated by @numueg/theme-plugin. Do not edit.",
     "// Regenerated on every `numu-theme build` from schemas/sections/*.json.",
     "//",
     "// Use it to get typed section settings:",
