@@ -81,6 +81,46 @@ interface ThemeManifest {
   description?: string;
   author?: string;
   presets?: Record<string, unknown>;
+  /**
+   * Phase 7.3 — relative path to a static HTML file the storefront
+   * injects on the client-side error boundary route. When set, BYOT
+   * themes own the "something went wrong" UI completely; absent →
+   * the platform's hardcoded fallback renders.
+   *
+   * Conventionally `"templates/error.html"`. Built path is
+   * `dist/<path>` and the URL surfaced to the storefront is
+   * `<external_theme.bundle_url_origin>/<path>`.
+   */
+  error_template?: string;
+  /**
+   * Phase 7.3 — same as `error_template` but for the streaming
+   * loading skeleton. Conventionally `"templates/loading.html"`.
+   */
+  loading_template?: string;
+  /**
+   * Phase 7.7 — theme-level variants (light / dark / brand-X / etc).
+   *
+   * Each variant is a named bundle of global setting overrides — a
+   * one-click way for merchants to swap the entire visual identity
+   * of a theme without editing every section. The customizer adds a
+   * dropdown above the locale toggle when this is non-empty; picking
+   * an entry merges the variant's settings onto the current draft.
+   *
+   * Example:
+   *   "variants": [
+   *     { "name": "Light",  "settings": { "primary_color": "#000", "bg": "#FFF" } },
+   *     { "name": "Dark",   "settings": { "primary_color": "#FFF", "bg": "#000" } },
+   *     { "name": "Bold",   "settings": { "accent": "#FF3D00", "heading_weight": 900 } }
+   *   ]
+   */
+  variants?: Array<{
+    /** Display label in the customizer dropdown. */
+    name: string;
+    /** Arabic display label, surfaced when the customizer's locale is `ar`. */
+    name_ar?: string;
+    /** Setting overrides merged onto global_settings on apply. */
+    settings: Record<string, unknown>;
+  }>;
 }
 
 export interface NumuThemePluginOptions {
@@ -467,6 +507,66 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
           req.method,
         );
       });
+
+      // Phase 7.7 — HMR signal for schema changes.
+      //
+      // The customizer iframe in the merchant hub reads
+      // `/sections.json` (sections + blocks) and `/settings_schema.json`
+      // (theme-level settings) to render its input forms. When a
+      // theme dev edits one of those files in their editor, the
+      // customizer needs to refetch — otherwise the dev sees their
+      // schema edit reflected in the bundle but NOT in the form
+      // controls (which renders the old shape forever).
+      //
+      // We piggy-back on Vite's built-in WebSocket: `server.ws.send`
+      // a custom event with the type the customizer listens for.
+      // The customizer's iframe-watcher (in V3) subscribes to
+      // `__numu_schema_changed` via window.addEventListener after
+      // it sets up its Vite WS connection.
+      const schemaWatchGlobs = [
+        path.join(themeDir, "settings_schema.json"),
+        path.join(themeDir, "schemas/sections"),
+        path.join(themeDir, "schemas/blocks"),
+        path.join(themeDir, "theme.json"),
+      ];
+      try {
+        server.watcher.add(schemaWatchGlobs);
+        const emitSchemaChanged = (changedPath: string) => {
+          server.ws.send({
+            type: "custom",
+            event: "numu:schema-changed",
+            data: { path: changedPath, at: Date.now() },
+          });
+        };
+        server.watcher.on("change", (p: string) => {
+          if (
+            p.endsWith("settings_schema.json") ||
+            p.endsWith("theme.json") ||
+            (p.includes(`${path.sep}schemas${path.sep}`) && p.endsWith(".json"))
+          ) {
+            emitSchemaChanged(p);
+          }
+        });
+        server.watcher.on("add", (p: string) => {
+          if (
+            p.includes(`${path.sep}schemas${path.sep}`) &&
+            p.endsWith(".json")
+          ) {
+            emitSchemaChanged(p);
+          }
+        });
+        server.watcher.on("unlink", (p: string) => {
+          if (
+            p.includes(`${path.sep}schemas${path.sep}`) &&
+            p.endsWith(".json")
+          ) {
+            emitSchemaChanged(p);
+          }
+        });
+      } catch {
+        // Vite versions without the watcher API just won't emit
+        // schema-changed; the customizer falls back to manual reload.
+      }
 
       // sections.json: synthesize from schemas/sections + schemas/blocks
       // on the fly so themes don't have to maintain a redundant file.
