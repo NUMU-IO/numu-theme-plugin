@@ -33,7 +33,7 @@ jobs:
           always-auth: true
 
       - name: Install
-        run: npm ci
+        run: npm install --no-fund --no-audit
 
       - name: Verify version matches tag
         if: github.event_name == 'release'
