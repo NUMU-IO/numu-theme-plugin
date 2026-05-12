@@ -15,7 +15,10 @@ on:
 
 permissions:
   contents: read
-  id-token: write   # for npm provenance (--provenance)
+  # `id-token: write` would be required for `npm publish --provenance`, but
+  # provenance only works when the source repo is PUBLIC. This repo is private;
+  # if it goes public, re-add `id-token: write` here AND the `--provenance` flag
+  # to both publish steps below.
 
 jobs:
   publish:
@@ -54,12 +57,12 @@ jobs:
 
       - name: Publish (dry-run)
         if: inputs.dry_run == 'true'
-        run: npm publish --dry-run --provenance --access public
+        run: npm publish --dry-run --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish
         if: github.event_name == 'release' && inputs.dry_run != 'true'
-        run: npm publish --provenance --access public
+        run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
