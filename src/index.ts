@@ -43,6 +43,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Plugin, UserConfig, ResolvedConfig } from "vite";
 
+// Pin PLUGIN_VERSION to package.json.version — see the constant
+// declaration below for the §6e-3 drift this avoids.
+import pkgJson from "../package.json";
+
 // ── Federation contract ──────────────────────────────────────────────────────
 //
 // Themes can be built in two modes:
@@ -157,7 +161,13 @@ interface BuiltManifest extends ThemeManifest {
   plugin_version: string;
 }
 
-const PLUGIN_VERSION = "0.2.0";
+// Sourced from package.json at build time (tsup inlines JSON imports
+// when resolveJsonModule is on). This eliminates the §6e-3 drift
+// class: the version embedded in dist/manifest.json and
+// dist/import-map.json can no longer disagree with the npm-published
+// `package.json.version`. To bump the plugin, change
+// `package.json.version` only — this constant follows automatically.
+const PLUGIN_VERSION: string = pkgJson.version;
 
 /**
  * The minimum @numueg/theme-sdk major a federated bundle is compatible
@@ -243,7 +253,12 @@ function validateContract(themeDir: string): ThemeManifest {
     );
   }
 
-  for (const field of ["id", "name", "version"] as const) {
+  // `author` is enforced by both CLI (`validateTheme()` rule 3) and now
+  // the plugin — resolves CLAUDE.md §6e-4 (formerly: CLI rejected
+  // missing author, plugin accepted it, theme devs saw the verdict
+  // depend on which validator ran last). Keep the four fields in sync
+  // when bumping either validator.
+  for (const field of ["id", "name", "version", "author"] as const) {
     if (!manifest[field] || typeof manifest[field] !== "string") {
       throw new Error(
         `[@numueg/theme-plugin] theme.json missing required string field: ${field}`,
@@ -568,6 +583,79 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
         // schema-changed; the customizer falls back to manual reload.
       }
 
+      // Generic dist-file middleware.
+      //
+      // Vite's lib mode emits the entry as `theme.js` plus one or more
+      // code-split chunks (e.g. `main-XXXX.js`, `Hero-YYYY.js`) whenever
+      // the entry has dynamic imports — and every NUMU theme does, because
+      // sections are lazy-loaded. The entry bundle then does
+      // `import "./main-XXXX.js"`, which the host iframe resolves
+      // against the dev server's origin.
+      //
+      // Without this middleware, those chunk URLs fall through to Vite's
+      // SPA fallback, which returns the project's `index.html` with
+      // `Content-Type: text/html`. Chrome rejects that as a module:
+      // "Failed to fetch dynamically imported module". The theme bundle
+      // entry loads but its dependencies don't, so the storefront's
+      // ByotThemeBoundary catches the error and falls back to V2.
+      //
+      // We mirror what the marketplace CDN does in production: serve
+      // every file in `dist/` at its corresponding URL. Files outside
+      // `dist/` (or that don't exist) fall through to Vite untouched.
+      const distContentTypes: Record<string, string> = {
+        ".js": "application/javascript; charset=utf-8",
+        ".mjs": "application/javascript; charset=utf-8",
+        ".css": "text/css; charset=utf-8",
+        ".json": "application/json; charset=utf-8",
+        ".map": "application/json; charset=utf-8",
+        ".html": "text/html; charset=utf-8",
+        ".svg": "image/svg+xml",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".woff": "font/woff",
+        ".woff2": "font/woff2",
+      };
+      server.middlewares.use((req, res, next) => {
+        if (req.method !== "GET" && req.method !== "HEAD") return next();
+        const rawUrl = req.url || "";
+        const url = rawUrl.split("?")[0];
+        if (!url || url === "/") return next();
+        const rel = url.startsWith("/") ? url.slice(1) : url;
+        if (rel.includes("..")) return next();
+        // The specific middlewares above (theme.js, theme.css, sections.json)
+        // already handled these — skip so we don't fight over the same URL.
+        // theme.json and settings_schema.json have canonical copies at the
+        // project root that get edited live in dev; serving the dist/ copies
+        // here would risk a stale read between rebuilds.
+        if (
+          rel === "theme.js" ||
+          rel === "theme.css" ||
+          rel === "sections.json" ||
+          rel === "theme.json" ||
+          rel === "settings_schema.json"
+        ) {
+          return next();
+        }
+        const filePath = path.join(distDir, rel);
+        if (!fs.existsSync(filePath)) return next();
+        const stat = fs.statSync(filePath);
+        if (!stat.isFile()) return next();
+        const ext = path.extname(rel).toLowerCase();
+        const contentType =
+          distContentTypes[ext] || "application/octet-stream";
+        res.setHeader("Content-Type", contentType);
+        res.setHeader("Content-Length", String(stat.size));
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Cache-Control", "no-store");
+        if (req.method === "HEAD") {
+          res.end();
+          return;
+        }
+        fs.createReadStream(filePath).pipe(res);
+      });
+
       // sections.json: synthesize from schemas/sections + schemas/blocks
       // on the fly so themes don't have to maintain a redundant file.
       server.middlewares.use("/sections.json", (req, res, next) => {
@@ -657,6 +745,39 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
         path.join(outDir, "manifest.json"),
         JSON.stringify(built, null, 2),
       );
+
+      // 3c. Copy theme.json + settings_schema.json into dist/.
+      //
+      // The backend's `connect_dev_server` (NUMU-api) probes the dev
+      // server for /theme.json + /settings_schema.json + /sections.json
+      // to fingerprint the bundle. Vite's `dev` server happens to serve
+      // project-root files implicitly, but `vite preview` only serves
+      // dist/. Copying these into dist/ makes BOTH `vite dev` and
+      // `vite preview` reachable for the backend probe — merchants can
+      // use either workflow.
+      for (const fileName of ["theme.json", "settings_schema.json"] as const) {
+        const src = path.join(themeDir, fileName);
+        const dst = path.join(outDir, fileName);
+        if (fs.existsSync(src) && !fs.existsSync(dst)) {
+          fs.copyFileSync(src, dst);
+        }
+      }
+
+      // 3d. Synthesize dist/sections.json from schemas/sections/*.json
+      // + schemas/blocks/*.json — same shape the dev middleware serves
+      // at request time. Optional but lets the backend's section picker
+      // bootstrap without spinning up the dev server.
+      const sectionsManifest = {
+        sections: collectSchemas(themeDir).sections,
+        blocks: collectSchemas(themeDir).blocks,
+      };
+      const sectionsJsonPath = path.join(outDir, "sections.json");
+      if (!fs.existsSync(sectionsJsonPath)) {
+        fs.writeFileSync(
+          sectionsJsonPath,
+          JSON.stringify(sectionsManifest, null, 2),
+        );
+      }
 
       // 4. Emit dist/import-map.json so the host can verify SDK compatibility.
       //
