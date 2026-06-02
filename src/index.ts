@@ -156,6 +156,11 @@ interface BuiltManifest extends ThemeManifest {
   settings_schema: unknown;
   section_schemas: Record<string, unknown>;
   block_schemas: Record<string, unknown>;
+  /** Embedded locale catalogs (`locales/<lang>.json`), keyed by lang
+   *  code. The host's "Edit theme content" surface reads these to list
+   *  the theme's full, real string set (grouped + searchable) instead of
+   *  a hard-coded dictionary. Empty when the theme ships no locales. */
+  locales: Record<string, unknown>;
   /** Build metadata. */
   built_at: string;
   plugin_version: string;
@@ -315,6 +320,35 @@ function collectSchemas(themeDir: string): SchemaBundle {
   const sections = readSchemaDir(path.join(themeDir, "schemas", "sections"));
   const blocks = readSchemaDir(path.join(themeDir, "schemas", "blocks"));
   return { settings, sections, blocks };
+}
+
+/**
+ * Read the theme's `locales/<lang>.json` catalog so the manifest can
+ * carry the full, real string set the merchant can override in the
+ * host's "Edit theme content" panel.
+ *
+ * Shopify convention is honored: `<lang>.default.json` (the source
+ * language) and `<lang>.json` (translations) both map to the bare lang
+ * code (the `.default` marker is stripped). A theme that ships no
+ * `locales/` dir simply yields `{}` — the host falls back to its
+ * built-in wording dictionary.
+ */
+function collectLocales(themeDir: string): Record<string, unknown> {
+  const dir = path.join(themeDir, "locales");
+  const out: Record<string, unknown> = {};
+  if (!fs.existsSync(dir)) return out;
+  for (const entry of fs.readdirSync(dir)) {
+    if (!entry.endsWith(".json")) continue;
+    const lang = entry.replace(/\.json$/, "").replace(/\.default$/, "");
+    try {
+      out[lang] = JSON.parse(
+        fs.readFileSync(path.join(dir, entry), "utf8"),
+      );
+    } catch {
+      // Skip a malformed locale file rather than failing the whole build.
+    }
+  }
+  return out;
 }
 
 /**
@@ -738,6 +772,7 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
         settings_schema: schemas.settings,
         section_schemas: schemas.sections,
         block_schemas: schemas.blocks,
+        locales: collectLocales(themeDir),
         built_at: new Date().toISOString(),
         plugin_version: PLUGIN_VERSION,
       };
