@@ -1,6 +1,6 @@
 {
   "name": "@numueg/theme-plugin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Vite plugin for NUMU themes — validates the manifest, externalizes the SDK + React, emits the federation manifest, and generates section schema types",
   "keywords": [
     "numu",
