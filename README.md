@@ -40,27 +40,23 @@ export default defineConfig({
 
 | Step | What |
 |---|---|
-| **Contract validation** | Asserts `src/main.tsx` exports `mount`; asserts React + SDK are externalized |
-| **Schema codegen** | `schemas/sections/*.json` → `src/__generated__/sections.d.ts` |
-| **Dev middleware** | Serves `/theme.js`, `/theme.css`, `/manifest.json`, `/sections.json`, `/runtime/*`, `/__numu/preview` |
-| **Federation externals** | Auto-injects React + SDK into `rollupOptions.external` |
-| **Asset pipeline** | Content-hashes `assets/*` and emits `dist/asset-manifest.json` |
-| **Manifest emission** | Writes `dist/manifest.json` with integrity hashes |
+| **Contract validation** | Requires `theme.json` + `settings_schema.json` + `styles.css`; finds the entry (`src/main.tsx` etc.) and asserts it exports `mount`; validates manifest fields (`id`, `name`, semver `version`); registry sync — every `schemas/sections/<type>.json` must have a matching `src/sections/<Type>.tsx` (hard fail), component-without-schema is a soft warning |
+| **Federation externals** | `federate: true` (default) externalizes `react`, `react-dom`, jsx runtimes, and `@numueg/theme-sdk` — the host provides them via its import map. `federate: false` builds a self-contained bundle |
+| **Dev middleware** | Serves `/theme.js`, `/theme.css`, `/sections.json` (synthesized live from schemas), and code-split chunks from `dist/`; emits a `numu:schema-changed` WebSocket event when schemas change so the customizer refetches forms |
+| **Schema codegen** | `schemas/sections/*.json` → `src/__generated__/sections.d.ts` (typed `settings` per section) |
+| **Manifest emission** | Writes `dist/manifest.json` (normalized theme.json + all section/block schemas + locale catalogs + build metadata) and `dist/import-map.json` (`plugin`, `federate`, `sdk_compat_major`, `host_provided`) — the host install endpoint refuses bundles with a mismatched `sdk_compat_major` |
+| **CSS fallback** | Copies `styles.css` → `dist/theme.css` if Vite didn't emit one |
+
+`theme.json` extras the plugin understands: `error_template` / `loading_template` (static HTML fallbacks) and `variants[]` (theme-level style variants).
 
 ## Options
 
 ```ts
 numuTheme({
-  themeRoot:      ".",                  // default
-  schemaDir:      "schemas",            // default
-  localeDir:      "locales",            // default
-  assetDir:       "assets",             // default
-  outDir:         "dist",               // default
-  manifestPath:   "theme.json",         // default
-  generatedDir:   "src/__generated__",  // default
-  strictContract: true,                 // default — fail on contract violation
-  emitMockPreview: true,                // default — serves /__numu/preview in dev
-  schemaWatchMs:  100,                  // debounce
+  themeDir: process.cwd(),  // theme root override
+  skipValidation: false,    // escape hatch for tests
+  federate: true,           // externalize React + SDK (default)
+  extraExternal: [],        // additional modules to externalize
 });
 ```
 
