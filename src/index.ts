@@ -19,6 +19,14 @@
  *      React names the bundle expects to be supplied with. The storefront
  *      verifies this on install so a theme submitted against an older SDK
  *      version is flagged before activation.
+ *   5. ssrPass (0.3.0, federated themes only) — runs a second, nested Vite
+ *      build of the same entry in SSR mode and emits `dist/theme.server.js`
+ *      (single file, dynamic imports inlined, react/sdk left as bare
+ *      specifiers). The storefront's SSR worker imports this file and
+ *      calls the theme's `createApp(ctx)` inside `renderToString`, which
+ *      is what gets external themes real server-rendered HTML. Themes
+ *      without a `createApp` export still build — they just stay
+ *      client-only.
  *
  * Usage in a theme's vite.config.ts:
  *
@@ -39,6 +47,7 @@
  *     });
  */
 
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Plugin, UserConfig, ResolvedConfig } from "vite";
@@ -142,6 +151,27 @@ export interface NumuThemePluginOptions {
   federate?: boolean;
   /** Additional modules to externalize beyond the federation defaults. */
   extraExternal?: readonly string[];
+  /**
+   * Emit `dist/theme.server.js` (an SSR build of the entry) alongside the
+   * client bundle so SSR-capable hosts can server-render the theme.
+   *
+   * Default: follows `federate` — federated bundles get the SSR pass,
+   * self-contained ones don't (a self-contained bundle carries its OWN
+   * React copy, which can't legally render inside the host's React on the
+   * server). Passing `ssr: true` together with `federate: false` is a
+   * contract violation and fails the build; `ssr: false` opts a federated
+   * theme out. When the pass is implicit (default) a failure inside the
+   * nested SSR build logs a warning and the theme ships client-only; when
+   * `ssr: true` was explicit, the failure fails the whole build.
+   */
+  ssr?: boolean;
+}
+
+/** Shape of the `ssr` block in dist/manifest.json + dist/import-map.json. */
+export interface SsrManifestInfo {
+  capable: boolean;
+  server_bundle?: string;
+  server_bundle_checksum?: string;
 }
 
 interface SchemaBundle {
@@ -164,6 +194,8 @@ interface BuiltManifest extends ThemeManifest {
   /** Build metadata. */
   built_at: string;
   plugin_version: string;
+  /** SSR artifact info (0.3.0) — `capable: false` for client-only themes. */
+  ssr: SsrManifestInfo;
 }
 
 // Sourced from package.json at build time (tsup inlines JSON imports
@@ -232,6 +264,9 @@ function validateContract(themeDir: string): ThemeManifest {
     const exportsMount =
       /\bexport\s+(?:async\s+)?function\s+mount\b/.test(entrySource) ||
       /\bexport\s+(?:const|let|var)\s+mount\b/.test(entrySource) ||
+      // Destructured form the SSR-era scaffold uses:
+      //   export const { mount, createApp } = defineThemeEntry(...)
+      /\bexport\s+(?:const|let|var)\s*\{[^}]*\bmount\b[^}]*\}/.test(entrySource) ||
       /\bexport\s*\{[^}]*\bmount\b[^}]*\}/.test(entrySource);
     if (!exportsMount) {
       throw new Error(
@@ -287,6 +322,35 @@ function validateContract(themeDir: string): ThemeManifest {
   }
 
   return manifest;
+}
+
+/**
+ * Informational `createApp` probe (0.3.0). A federated theme without
+ * `createApp` builds fine but can never be server-rendered — the host
+ * detects the missing export at SSR time and silently keeps the theme
+ * client-only. Surfacing it at build time saves the "why is my theme not
+ * SSR'd" support round-trip. Same text-level matching as the mount check.
+ */
+function entryExportsCreateApp(themeDir: string): boolean {
+  const entry = ENTRY_CANDIDATES.find((p) =>
+    fs.existsSync(path.join(themeDir, p)),
+  );
+  if (!entry) return false;
+  try {
+    const src = fs.readFileSync(path.join(themeDir, entry), "utf-8");
+    return (
+      /\bexport\s+(?:async\s+)?function\s+createApp\b/.test(src) ||
+      /\bexport\s+(?:const|let|var)\s+createApp\b/.test(src) ||
+      /\bexport\s+(?:const|let|var)\s*\{[^}]*\bcreateApp\b[^}]*\}/.test(src) ||
+      /\bexport\s*\{[^}]*\bcreateApp\b[^}]*\}/.test(src)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function sha256File(p: string): string {
+  return crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");
 }
 
 // ── Schema collection ───────────────────────────────────────────────────────
@@ -434,6 +498,23 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
     ...(options.extraExternal ?? []),
   ];
 
+  // SSR pass plumbing (0.3.0). The nested SSR build re-loads the theme's
+  // vite config — which instantiates this plugin AGAIN. That inner instance
+  // must (a) not recurse into another SSR pass, (b) not re-validate, and
+  // (c) not re-emit manifests over the primary instance's output. The env
+  // var is the recursion fence; it's process-local and cleared in finally.
+  const isSsrPass = process.env.NUMU_THEME_SSR_PASS === "1";
+  const ssrEnabled = options.ssr ?? federate;
+  if (options.ssr === true && !federate) {
+    throw new Error(
+      "[@numueg/theme-plugin] `ssr: true` requires `federate: true` — a " +
+        "self-contained bundle ships its own React copy, which cannot " +
+        "render inside the host's React on the server. Drop `federate: " +
+        "false` (hosts ≥ 0.2.0 all serve the runtime import map) or drop " +
+        "`ssr: true`.",
+    );
+  }
+
   let manifest: ThemeManifest | null = null;
   let resolvedConfig: ResolvedConfig | null = null;
 
@@ -443,12 +524,25 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
 
     config(userConfig: UserConfig) {
       // 1. Contract check happens here — fail loudly before Vite spends
-      //    time configuring the bundler.
-      if (!options.skipValidation) {
+      //    time configuring the bundler. The nested SSR pass skips it (the
+      //    primary pass just validated the same tree).
+      if (!options.skipValidation && !isSsrPass) {
         manifest = validateContract(themeDir);
         // Registry/schema sync (Phase 2.6). Catches the
         // schemas-without-components drift before customizer runtime.
         validateSectionRegistry(themeDir);
+        if (ssrEnabled && federate && !entryExportsCreateApp(themeDir)) {
+          console.warn(
+            "[@numueg/theme-plugin] Theme entry exports `mount` but not " +
+              "`createApp` — the theme builds fine but hosts cannot " +
+              "server-render it (client-only). Use `defineThemeEntry` " +
+              "from @numueg/theme-sdk ≥ 0.3 to export both from one " +
+              "component:\n" +
+              "  const entry = defineThemeEntry((args) => <ThemeApp ... />);\n" +
+              "  export const mount = entry.mount;\n" +
+              "  export const createApp = entry.createApp;",
+          );
+        }
       }
 
       // 2. Externalize host-provided modules. We MERGE rather than replace
@@ -716,7 +810,12 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
       });
     },
 
-    closeBundle() {
+    async closeBundle() {
+      // Nested SSR pass: the PRIMARY instance owns every emit step below
+      // (manifest, import-map, css copy, codegen). The inner instance's
+      // only job was building dist/theme.server.js — done by now.
+      if (isSsrPass) return;
+
       if (!manifest && !options.skipValidation) {
         // Either validation is off or we somehow lost it; reload.
         manifest = validateContract(themeDir);
@@ -765,6 +864,86 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
       // the file (or commit if they prefer — it's deterministic).
       writeSectionTypes(themeDir, collectSchemas(themeDir).sections);
 
+      // 5. SSR pass (0.3.0) — nested Vite build of the same entry, SSR
+      // mode, emitting dist/theme.server.js BEFORE the manifest so the
+      // manifest can embed the artifact checksum.
+      //
+      // Shape requirements the storefront worker depends on:
+      //   - SINGLE FILE. Sections are lazy-loaded (dynamic import), and a
+      //     code-split SSR bundle would emit sibling chunks the upload
+      //     pipeline doesn't ship → `inlineDynamicImports: true`.
+      //   - Bare react/react-dom/sdk specifiers (the worker resolves them
+      //     against the HOST's node_modules so one React renders both
+      //     sides) → same external list as the client bundle.
+      //   - Everything else inlined (the worker provides nothing beyond
+      //     react + sdk) → `ssr.noExternal: true`.
+      let ssrInfo: SsrManifestInfo = { capable: false };
+      if (ssrEnabled && federate) {
+        const configFile = resolvedConfig.configFile;
+        if (!configFile) {
+          console.warn(
+            "[@numueg/theme-plugin] SSR pass skipped: no vite config file " +
+              "to re-load for the nested build (programmatic builds should " +
+              "pass one). Theme ships client-only.",
+          );
+        } else {
+          // Force a production-grade artifact no matter what env the caller
+          // runs under (vitest sets NODE_ENV=test; a dev script might set
+          // development) — otherwise Vite emits the jsx-DEV runtime with
+          // per-element file/line metadata into the server bundle.
+          const prevNodeEnv = process.env.NODE_ENV;
+          try {
+            process.env.NUMU_THEME_SSR_PASS = "1";
+            process.env.NODE_ENV = "production";
+            const { build } = await import("vite");
+            await build({
+              configFile,
+              root: resolvedConfig.root,
+              mode: "production",
+              logLevel: "warn",
+              ssr: { noExternal: true },
+              build: {
+                lib: false,
+                ssr: detectEntry(themeDir),
+                outDir: resolvedConfig.build.outDir,
+                emptyOutDir: false,
+                ssrEmitAssets: false,
+                rollupOptions: {
+                  external: externalList,
+                  output: {
+                    entryFileNames: "theme.server.js",
+                    format: "es",
+                    inlineDynamicImports: true,
+                  },
+                },
+              },
+            });
+            const serverBundlePath = path.join(outDir, "theme.server.js");
+            if (fs.existsSync(serverBundlePath)) {
+              ssrInfo = {
+                capable: true,
+                server_bundle: "theme.server.js",
+                server_bundle_checksum: sha256File(serverBundlePath),
+              };
+            }
+          } catch (err) {
+            const msg = `[@numueg/theme-plugin] SSR bundle pass failed: ${(err as Error).message}`;
+            if (options.ssr === true) {
+              // Explicit opt-in → the author is counting on SSR; fail loud.
+              throw new Error(msg);
+            }
+            console.warn(`${msg} — theme ships client-only.`);
+          } finally {
+            delete process.env.NUMU_THEME_SSR_PASS;
+            if (prevNodeEnv === undefined) {
+              delete process.env.NODE_ENV;
+            } else {
+              process.env.NODE_ENV = prevNodeEnv;
+            }
+          }
+        }
+      }
+
       // 3. Emit dist/manifest.json
       const schemas = collectSchemas(themeDir);
       const built: BuiltManifest = {
@@ -775,6 +954,7 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
         locales: collectLocales(themeDir),
         built_at: new Date().toISOString(),
         plugin_version: PLUGIN_VERSION,
+        ssr: ssrInfo,
       };
       fs.writeFileSync(
         path.join(outDir, "manifest.json"),
@@ -832,6 +1012,16 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
         federate,
         sdk_compat_major: SDK_COMPAT_MAJOR,
         host_provided: externalList,
+        // SSR artifact declaration (0.3.0): the backend build workers read
+        // these to know whether/what to upload as the server bundle, and
+        // activation gates verify the checksum end-to-end.
+        ssr_capable: ssrInfo.capable,
+        ...(ssrInfo.capable
+          ? {
+              server_bundle: ssrInfo.server_bundle,
+              server_bundle_checksum: ssrInfo.server_bundle_checksum,
+            }
+          : {}),
       };
       fs.writeFileSync(
         path.join(outDir, "import-map.json"),
