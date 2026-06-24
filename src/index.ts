@@ -194,6 +194,10 @@ interface BuiltManifest extends ThemeManifest {
   /** Build metadata. */
   built_at: string;
   plugin_version: string;
+  /** @numueg/theme-sdk version the theme built against (null if unresolved). */
+  sdk_version: string | null;
+  /** Theme-contract version (see THEME_CONTRACT_VERSION). */
+  contract_version: number;
   /** SSR artifact info (0.3.0) — `capable: false` for client-only themes. */
   ssr: SsrManifestInfo;
 }
@@ -214,6 +218,33 @@ const PLUGIN_VERSION: string = pkgJson.version;
  * SDK breaking change.
  */
 const SDK_COMPAT_MAJOR = 0;
+
+/**
+ * Theme-contract version this plugin stamps into the built manifest +
+ * import-map. The storefront/backend refuse bundles whose `contract_version`
+ * they don't support. MUST stay in lockstep with
+ * `@numueg/theme-sdk` `THEME_CONTRACT_VERSION` and the backend's
+ * `HOST_CONTRACT_VERSION` — bump all three together on a breaking change to
+ * what a built theme must look like.
+ */
+const THEME_CONTRACT_VERSION = 1;
+
+/** Best-effort read of the @numueg/theme-sdk version the theme actually built
+ *  against (from its node_modules). Stamped into the manifest so the host can
+ *  report/track the SDK a published bundle was compiled with. */
+function readThemeSdkVersion(themeDir: string): string | null {
+  try {
+    const pkg = JSON.parse(
+      fs.readFileSync(
+        path.join(themeDir, "node_modules", "@numueg", "theme-sdk", "package.json"),
+        "utf-8",
+      ),
+    );
+    return typeof pkg.version === "string" ? pkg.version : null;
+  } catch {
+    return null;
+  }
+}
 
 // ── Contract validation ─────────────────────────────────────────────────────
 
@@ -954,6 +985,8 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
         locales: collectLocales(themeDir),
         built_at: new Date().toISOString(),
         plugin_version: PLUGIN_VERSION,
+        sdk_version: readThemeSdkVersion(themeDir),
+        contract_version: THEME_CONTRACT_VERSION,
         ssr: ssrInfo,
       };
       fs.writeFileSync(
@@ -1011,6 +1044,11 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
         plugin: PLUGIN_VERSION,
         federate,
         sdk_compat_major: SDK_COMPAT_MAJOR,
+        // Contract-version gate: the storefront/backend refuse a bundle whose
+        // contract_version exceeds what they support. sdk_version is the SDK
+        // the theme compiled against (informational / diagnostics).
+        contract_version: THEME_CONTRACT_VERSION,
+        sdk_version: readThemeSdkVersion(themeDir),
         host_provided: externalList,
         // SSR artifact declaration (0.3.0): the backend build workers read
         // these to know whether/what to upload as the server bundle, and
