@@ -44,7 +44,7 @@ export default defineConfig({
 | **Federation externals** | `federate: true` (default) externalizes `react`, `react-dom`, jsx runtimes, and `@numueg/theme-sdk` — the host provides them via its import map. `federate: false` builds a self-contained bundle |
 | **Dev middleware** | Serves `/theme.js`, `/theme.css`, `/sections.json` (synthesized live from schemas), and code-split chunks from `dist/`; emits a `numu:schema-changed` WebSocket event when schemas change so the customizer refetches forms |
 | **Schema codegen** | `schemas/sections/*.json` → `src/__generated__/sections.d.ts` (typed `settings` per section) |
-| **Manifest emission** | Writes `dist/manifest.json` (normalized theme.json + all section/block schemas + locale catalogs + build metadata) and `dist/import-map.json` (`plugin`, `federate`, `sdk_compat_major`, `host_provided`) — the host install endpoint refuses bundles with a mismatched `sdk_compat_major` |
+| **Manifest emission** | Writes `dist/manifest.json` (normalized theme.json + all section/block schemas + locale catalogs + build metadata) and `dist/import-map.json` (`plugin`, `federate`, `sdk_compat_major`, `sdk_compat_minor`, `host_provided`) — the host install endpoint refuses bundles with a mismatched `sdk_compat_major`, and (while on major 0, where minors are breaking) any bundle whose `sdk_compat_minor` exceeds the host's served SDK minor |
 | **CSS fallback** | Copies `styles.css` → `dist/theme.css` if Vite didn't emit one |
 
 `theme.json` extras the plugin understands: `error_template` / `loading_template` (static HTML fallbacks) and `variants[]` (theme-level style variants).

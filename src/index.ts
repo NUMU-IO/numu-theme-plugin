@@ -216,6 +216,13 @@ const PLUGIN_VERSION: string = pkgJson.version;
  * /__numu-runtime/manifest.json; install validation refuses bundles
  * whose `sdk_compat` major doesn't match the host's. Bumped on every
  * SDK breaking change.
+ *
+ * While we're still on major 0, MINOR bumps are themselves breaking, so
+ * the import-map also carries a companion `sdk_compat_minor` (derived per
+ * build from the SDK the theme compiled against — see `parseSemverMinor`).
+ * The storefront loader rejects a bundle whose `sdk_compat_minor` is
+ * greater than the host's served SDK minor. That field is purely additive:
+ * bundles emitted before it existed have no field and stay compatible.
  */
 const SDK_COMPAT_MAJOR = 0;
 
@@ -244,6 +251,21 @@ function readThemeSdkVersion(themeDir: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Parse the MINOR component out of a semver string (e.g. "0.6.1" → 6) for
+ * the import-map's `sdk_compat_minor` gate. In 0.x, MINOR bumps are
+ * breaking, so the storefront loader rejects a bundle whose built-against
+ * SDK minor is newer than the host's currently-served SDK minor. Returns
+ * null when the version is absent or unparseable — a missing field is
+ * treated as compatible by the loader, which is the safe default when we
+ * can't determine what the theme built against.
+ */
+function parseSemverMinor(version: string | null): number | null {
+  if (!version) return null;
+  const minor = Number.parseInt(version.split(".")[1] ?? "", 10);
+  return Number.isInteger(minor) ? minor : null;
 }
 
 // ── Contract validation ─────────────────────────────────────────────────────
@@ -1040,15 +1062,28 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
       // expects the import map to resolve. The host's runtime manifest
       // must satisfy all of them (today: react, react/jsx-runtime,
       // react-dom, react-dom/client, @numueg/theme-sdk).
+      // Read the built-against SDK version ONCE so the reported `sdk_version`
+      // and the derived `sdk_compat_minor` are guaranteed to agree (no
+      // version-report drift between two separate node_modules reads).
+      const sdkVersion = readThemeSdkVersion(themeDir);
+      const sdkCompatMinor = parseSemverMinor(sdkVersion);
       const importMap = {
         plugin: PLUGIN_VERSION,
         federate,
         sdk_compat_major: SDK_COMPAT_MAJOR,
+        // Minor gate (0.x): while the major is 0, minor bumps are breaking, so
+        // the storefront loader also rejects a bundle whose `sdk_compat_minor`
+        // exceeds the host's served SDK minor. Derived from `sdk_version`
+        // below; omitted when the SDK version can't be resolved so the loader
+        // treats the bundle as compatible (its documented missing-field path).
+        ...(sdkCompatMinor !== null
+          ? { sdk_compat_minor: sdkCompatMinor }
+          : {}),
         // Contract-version gate: the storefront/backend refuse a bundle whose
         // contract_version exceeds what they support. sdk_version is the SDK
         // the theme compiled against (informational / diagnostics).
         contract_version: THEME_CONTRACT_VERSION,
-        sdk_version: readThemeSdkVersion(themeDir),
+        sdk_version: sdkVersion,
         host_provided: externalList,
         // SSR artifact declaration (0.3.0): the backend build workers read
         // these to know whether/what to upload as the server bundle, and
