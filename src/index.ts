@@ -138,6 +138,15 @@ interface ThemeManifest {
     /** Setting overrides merged onto global_settings on apply. */
     settings: Record<string, unknown>;
   }>;
+  /**
+   * I3 — the theme renders global sections itself (via `useSectionGroup`),
+   * i.e. it owns its header/footer/announcement groups from
+   * `themeSettings.section_groups` rather than relying on the host to render
+   * them. Declared in `theme.json`; the plugin echoes it into the import-map
+   * so the storefront knows not to render its own global-section chrome around
+   * the bundle. Defaults to false (omitted) — pre-I3 themes are unaffected.
+   */
+  renders_global_sections?: boolean;
 }
 
 export interface NumuThemePluginOptions {
@@ -1084,6 +1093,14 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
         // the theme compiled against (informational / diagnostics).
         contract_version: THEME_CONTRACT_VERSION,
         sdk_version: sdkVersion,
+        // I3 — the theme renders its own global sections (header/footer/etc via
+        // useSectionGroup); the storefront then skips its built-in global-section
+        // chrome around the bundle. Read from theme.json; additive — emitted only
+        // when the theme opts in, so a missing field reads as false (its
+        // documented default) for bundles built before this existed.
+        ...(manifest.renders_global_sections === true
+          ? { renders_global_sections: true }
+          : {}),
         host_provided: externalList,
         // SSR artifact declaration (0.3.0): the backend build workers read
         // these to know whether/what to upload as the server bundle, and
