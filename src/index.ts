@@ -55,6 +55,10 @@ import type { Plugin, UserConfig, ResolvedConfig } from "vite";
 // Pin PLUGIN_VERSION to package.json.version — see the constant
 // declaration below for the §6e-3 drift this avoids.
 import pkgJson from "../package.json";
+// The manifest field/semver/id-format rules live in ONE place — the SDK's
+// React-free validation module — so the plugin (build gate), the CLI
+// (`numu-theme check`), and the backend can't drift from each other.
+import { validateManifest } from "@numueg/theme-sdk/validation";
 
 // ── Federation contract ──────────────────────────────────────────────────────
 //
@@ -346,31 +350,27 @@ function validateContract(themeDir: string): ThemeManifest {
     );
   }
 
-  // `author` is enforced by both CLI (`validateTheme()` rule 3) and now
-  // the plugin — resolves CLAUDE.md §6e-4 (formerly: CLI rejected
-  // missing author, plugin accepted it, theme devs saw the verdict
-  // depend on which validator ran last). Keep the four fields in sync
-  // when bumping either validator.
-  for (const field of ["id", "name", "version", "author"] as const) {
-    if (!manifest[field] || typeof manifest[field] !== "string") {
-      throw new Error(
-        `[@numueg/theme-plugin] theme.json missing required string field: ${field}`,
-      );
-    }
-  }
-
-  // Same semver rule the backend enforces.
-  const semver = /^\d+\.\d+\.\d+(?:[-+][\w.\-]+)?$/;
-  if (!semver.test(manifest.version)) {
+  // Manifest field checks — required fields (`id`, `name`, `version`,
+  // `author`), lowercase `id` format, and strict semver — are delegated to
+  // @numueg/theme-sdk/validation `validateManifest`, the SINGLE source of
+  // truth the CLI (`numu-theme check`) and the backend contract gate also use.
+  //
+  // Previously the plugin carried its OWN copies: a required-string-field
+  // loop, a semver regex, and a CASE-INSENSITIVE id regex (`/…/i`). The last
+  // one disagreed with the SDK's lowercase-only `id` rule, so a mixed-case id
+  // built here but was rejected by the backend contract check downstream.
+  // Delegating removes that drift. (§6e-4 stays satisfied: the SDK requires
+  // `author`. `name` may now be a string OR a bilingual object, matching the
+  // SDK contract.) We throw on errors only — the empty-presets / missing-
+  // template warnings are surfaced by `numu-theme check`, not the build.
+  const manifestResult = validateManifest(manifest);
+  const errors = manifestResult.issues.filter((i) => i.level === "error");
+  if (errors.length > 0) {
     throw new Error(
-      `[@numueg/theme-plugin] theme.json version "${manifest.version}" is not semver (x.y.z)`,
-    );
-  }
-
-  // Validate id format (alphanumeric, dashes, underscores).
-  if (!/^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$/i.test(manifest.id)) {
-    throw new Error(
-      `[@numueg/theme-plugin] theme.json id "${manifest.id}" must be alphanumerics, dashes or underscores`,
+      `[@numueg/theme-plugin] theme.json failed validation:\n` +
+        errors
+          .map((e) => `  - ${e.message}${e.path ? ` (${e.path})` : ""}`)
+          .join("\n"),
     );
   }
 
