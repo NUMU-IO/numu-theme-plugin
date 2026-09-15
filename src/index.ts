@@ -50,7 +50,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { Plugin, UserConfig, ResolvedConfig } from "vite";
+import { transformWithEsbuild, type Plugin, type UserConfig, type ResolvedConfig } from "vite";
 
 // Pin PLUGIN_VERSION to package.json.version — see the constant
 // declaration below for the §6e-3 drift this avoids.
@@ -178,6 +178,19 @@ export interface NumuThemePluginOptions {
    * `ssr: true` was explicit, the failure fails the whole build.
    */
   ssr?: boolean;
+  /**
+   * Whitespace-minify the emitted client chunks (default: true).
+   *
+   * `build.minify` cannot do it in an ES library build: Vite forces
+   * `minifyWhitespace: false` there, so every comment and indent shipped
+   * (Lighthouse charged vionne 37 KiB of unminified-javascript). A theme is a
+   * leaf artifact the storefront imports straight from the CDN — nothing
+   * downstream minifies it. Runs in `generateBundle`, after Vite's own
+   * esbuild pass, which would otherwise re-print the code pretty.
+   * Four themes vendor this as a local `minifyThemeBundle`; it is idempotent,
+   * so delete the copy the next time the theme changes.
+   */
+  minify?: boolean;
 }
 
 /** Shape of the `ssr` block in dist/manifest.json + dist/import-map.json. */
@@ -372,7 +385,16 @@ function validateContract(themeDir: string): ThemeManifest {
   // `author`. `name` may now be a string OR a bilingual object, matching the
   // SDK contract.) We throw on errors only — the empty-presets / missing-
   // template warnings are surfaced by `numu-theme check`, not the build.
-  const manifestResult = validateManifest(manifest);
+  //
+  // `sectionTypes` turns on the SDK's preset <-> schema check: a preset
+  // (templates or section_groups) referencing a type with no
+  // schemas/sections/<type>.json is an error — the storefront would silently
+  // strip it. Keyed by exact FILENAME, not the schema `type` field (street's
+  // schemas have none), and case-sensitive like the SDK comparison.
+  const sectionTypes = new Set(
+    Object.keys(readSchemaDir(path.join(themeDir, "schemas", "sections"))),
+  );
+  const manifestResult = validateManifest(manifest, { sectionTypes });
   const errors = manifestResult.issues.filter((i) => i.level === "error");
   if (errors.length > 0) {
     throw new Error(
@@ -647,6 +669,23 @@ export function numuTheme(options: NumuThemePluginOptions = {}): Plugin {
 
     configResolved(config) {
       resolvedConfig = config;
+    },
+
+    async generateBundle(_outputOptions, bundle) {
+      // Client bundle only: the nested SSR pass stays readable for stack traces.
+      if (options.minify === false || isSsrPass || resolvedConfig?.command !== "build") return;
+      for (const [fileName, output] of Object.entries(bundle)) {
+        if (output.type !== "chunk" || !fileName.endsWith(".js")) continue;
+        // esnext: minify only, never change the browser support matrix.
+        const result = await transformWithEsbuild(output.code, fileName, {
+          loader: "js",
+          format: "esm",
+          target: "esnext",
+          minify: true,
+          legalComments: "none",
+        });
+        output.code = result.code;
+      }
     },
 
     // Mount middleware so the dev server satisfies the backend dev-mode

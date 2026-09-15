@@ -4,6 +4,10 @@ All notable changes to `@numueg/theme-plugin` are documented here. The format is
 
 ## [Unreleased]
 
+### Added
+
+- **Bundle minification** (`minify`, default `true`): client JS chunks are whitespace-minified in `generateBundle`. `build.minify` is a no-op in an ES library build (Vite forces `minifyWhitespace: false`), so every theme shipped its comments and indentation. Uses Vite's own `transformWithEsbuild` (no new dependency), `target: esnext` (no downlevelling), and skips the SSR pass. Themes that vendor a local `minifyThemeBundle` (vionne, genova, teen, powells) can delete it after upgrading; running both is harmless.
+
 ## [0.1.0] - 2026-05-11
 
 First public release. Full surface documented at [numueg.app/docs/cli-plugin/vite-plugin](https://numueg.app/docs/cli-plugin/vite-plugin).
