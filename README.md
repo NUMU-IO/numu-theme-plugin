@@ -62,9 +62,9 @@ numuTheme({
 
 ## Docs
 
-- [Plugin Reference](https://numueg.app/docs/cli-plugin/vite-plugin)
-- [Theme Engine Architecture](https://numueg.app/docs/theme-engine/architecture)
-- [BYOT Contract](https://numueg.app/docs/theme-engine/byot-contract)
+- [Plugin Reference](https://developers.numueg.app/cli-plugin/vite-plugin)
+- [Theme Engine Architecture](https://developers.numueg.app/theme-engine/architecture)
+- [BYOT Contract](https://developers.numueg.app/theme-engine/byot-contract)
 
 ## License
 

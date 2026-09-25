@@ -14,7 +14,7 @@
   ],
   "license": "MIT",
   "author": "NUMU <hello@numueg.app>",
-  "homepage": "https://numueg.app/docs/cli-plugin/vite-plugin",
+  "homepage": "https://developers.numueg.app/cli-plugin/vite-plugin",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/NUMU-IO/numu-theme-plugin.git"
